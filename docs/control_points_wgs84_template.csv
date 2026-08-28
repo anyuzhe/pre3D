@@ -1,0 +1,4 @@
+point_id,role,model_x,model_y,model_z,longitude,latitude,height,sigma_x,sigma_y,sigma_z,target_crs
+GCP01,control,1.235,2.460,0.815,120.12345678,30.12345678,85.432,0.02,0.02,0.04,
+GCP02,control,5.672,1.884,0.932,120.12356789,30.12351234,84.965,0.02,0.02,0.04,
+CHK01,check,3.554,4.120,1.105,120.12350123,30.12348876,85.105,0.02,0.02,0.04,

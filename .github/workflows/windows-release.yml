@@ -1,0 +1,117 @@
+name: Windows Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-installer:
+    name: Test and package Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+
+      - name: Resolve application version
+        shell: pwsh
+        run: |
+          $content = Get-Content pyproject.toml -Raw -Encoding UTF8
+          $match = [regex]::Match($content, '(?m)^version\s*=\s*"([^"]+)"')
+          if (-not $match.Success) { throw "Cannot read version from pyproject.toml" }
+          $version = $match.Groups[1].Value
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
+            if ($tagVersion -ne $version) {
+              throw "Tag version $tagVersion does not match pyproject version $version"
+            }
+          }
+          "APP_VERSION=$version" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: .\scripts\setup.ps1 -PythonCommand python
+
+      - name: Run automated tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pytest -q
+          .\.venv\Scripts\python.exe app.py --smoke-test
+
+      - name: Download COLMAP CUDA runtime
+        shell: pwsh
+        run: .\scripts\install_colmap.ps1
+
+      - name: Download and verify AI matching models
+        shell: pwsh
+        run: .\scripts\download_colmap_ai_models.ps1
+
+      - name: Install redistributable CUDA and cuDNN runtime source
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pip install `
+            --index-url https://download.pytorch.org/whl/cu128 `
+            "torch==2.7.1"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      - name: Build and verify Windows installer
+        shell: pwsh
+        run: .\scripts\build_release.ps1 -Version $env:APP_VERSION
+
+      - name: Publish workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre3D-${{ env.APP_VERSION }}-Windows-x64
+          path: |
+            release/*.exe
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem release -File | ForEach-Object { $_.FullName })
+          if ($assets.Count -lt 2) { throw "Installer or checksum is missing" }
+          gh release create "${{ github.ref_name }}" @assets `
+            --repo "${{ github.repository }}" `
+            --title "pre3D ${{ github.ref_name }}" `
+            --generate-notes `
+            --verify-tag
+
+      - name: Write build summary
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_STEP_SUMMARY "## pre3D Windows build"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Version: ``$env:APP_VERSION``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Ref: ``${{ github.ref }}``"
+          if (Test-Path release\SHA256SUMS.txt) {
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Installer and SHA-256 checksum were generated."
+          }
