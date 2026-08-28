@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import psutil
 from PIL import Image
 
@@ -39,8 +41,11 @@ _logger = logging.getLogger(__name__)
 _COLMAP_AI_MODELS = {
     "aliked-n16rot.onnx": "39c423d0a6f03d39ec89d3d1d61853765c2fb6a8b8381376c703e5758778a547",
     "aliked-lightglue.onnx": "b9a5de7204648b18a8cf5dcac819f9d30de1a5961ef03756803c8b86c2dceb8d",
+    "bruteforce-matcher.onnx": "3c1282f96d83f5ffc861a873298d08bbe5219f59af59223f5ceab5c41a182a47",
     "sift-lightglue.onnx": "e0500228472b43f92b3d36881a09b3310d3b058b56187b246cc7b9ab6429096e",
 }
+
+_COLMAP_PAIR_ID_MAX = 2_147_483_647
 
 
 def _runtime_library_directories(executable: str) -> list[str]:
@@ -184,6 +189,291 @@ def _database_images(database_path: Path) -> list[tuple[int, int, str]]:
     return [(int(image_id), int(camera_id), str(name)) for image_id, camera_id, name in rows]
 
 
+def _decode_colmap_pair_id(pair_id: int) -> tuple[int, int]:
+    image_id2 = int(pair_id) % _COLMAP_PAIR_ID_MAX
+    image_id1 = (int(pair_id) - image_id2) // _COLMAP_PAIR_ID_MAX
+    return image_id1, image_id2
+
+
+def _encode_colmap_pair_id(image_id1: int, image_id2: int) -> int:
+    first, second = sorted((int(image_id1), int(image_id2)))
+    return first * _COLMAP_PAIR_ID_MAX + second
+
+
+def _database_verified_match_components(
+    database_path: Path,
+    *,
+    min_num_inliers: int,
+) -> list[list[int]]:
+    """Return verified image-graph components, largest first."""
+
+    connection = sqlite3.connect(database_path)
+    try:
+        image_ids = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT image_id FROM images ORDER BY image_id"
+            )
+        ]
+        edges = connection.execute(
+            "SELECT pair_id FROM two_view_geometries WHERE rows >= ?",
+            (int(min_num_inliers),),
+        ).fetchall()
+    finally:
+        connection.close()
+    image_set = set(image_ids)
+    adjacency: dict[int, set[int]] = {image_id: set() for image_id in image_ids}
+    for (pair_id,) in edges:
+        first, second = _decode_colmap_pair_id(int(pair_id))
+        if first in image_set and second in image_set:
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+    components: list[list[int]] = []
+    visited: set[int] = set()
+    for image_id in image_ids:
+        if image_id in visited:
+            continue
+        component: list[int] = []
+        stack = [image_id]
+        visited.add(image_id)
+        while stack:
+            current = stack.pop()
+            component.append(current)
+            for neighbor in adjacency[current]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        components.append(sorted(component))
+    return sorted(components, key=lambda values: (-len(values), values[0]))
+
+
+def _database_verified_pair_count(
+    database_path: Path,
+    *,
+    min_num_inliers: int,
+) -> int:
+    connection = sqlite3.connect(database_path)
+    try:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM two_view_geometries WHERE rows >= ?",
+            (int(min_num_inliers),),
+        ).fetchone()
+    finally:
+        connection.close()
+    return int(row[0]) if row else 0
+
+
+def _database_global_descriptor_means(
+    connection: sqlite3.Connection,
+) -> dict[int, np.ndarray]:
+    """Build compact retrieval vectors from already cached local features."""
+
+    vectors: dict[int, np.ndarray] = {}
+    query = "SELECT image_id, type, rows, cols, data FROM descriptors"
+    for image_id, descriptor_type, rows, cols, blob in connection.execute(query):
+        row_count = int(rows)
+        column_count = int(cols)
+        if not blob or row_count <= 0 or column_count <= 0:
+            continue
+        if int(descriptor_type) == 1:
+            dimension = column_count // np.dtype("<f4").itemsize
+            if dimension <= 0:
+                continue
+            values = np.frombuffer(blob, dtype="<f4")
+        else:
+            dimension = column_count
+            values = np.frombuffer(blob, dtype=np.uint8)
+        if len(values) != row_count * dimension:
+            continue
+        descriptors = values.reshape(row_count, dimension)
+        vector = descriptors.mean(axis=0, dtype=np.float64).astype(np.float32)
+        norm = float(np.linalg.norm(vector))
+        if math.isfinite(norm) and norm > np.finfo(np.float32).eps:
+            vectors[int(image_id)] = vector / norm
+    return vectors
+
+
+def _geodetic_to_ecef(position: tuple[float, float, float]) -> np.ndarray:
+    """Convert WGS84 latitude/longitude/altitude to metric ECEF."""
+
+    latitude, longitude, altitude = position
+    latitude_rad = math.radians(latitude)
+    longitude_rad = math.radians(longitude)
+    semi_major = 6_378_137.0
+    eccentricity_squared = 6.69437999014e-3
+    sin_latitude = math.sin(latitude_rad)
+    prime_vertical = semi_major / math.sqrt(
+        1.0 - eccentricity_squared * sin_latitude * sin_latitude
+    )
+    return np.asarray(
+        [
+            (prime_vertical + altitude)
+            * math.cos(latitude_rad)
+            * math.cos(longitude_rad),
+            (prime_vertical + altitude)
+            * math.cos(latitude_rad)
+            * math.sin(longitude_rad),
+            (
+                prime_vertical * (1.0 - eccentricity_squared)
+                + altitude
+            )
+            * sin_latitude,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _database_pose_prior_positions(
+    connection: sqlite3.Connection,
+) -> dict[int, np.ndarray]:
+    """Read metric camera positions from COLMAP pose priors when available."""
+
+    try:
+        rows = connection.execute(
+            "SELECT corr_data_id, position, coordinate_system "
+            "FROM pose_priors WHERE position IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    positions: dict[int, np.ndarray] = {}
+    for image_id, blob, coordinate_system in rows:
+        if blob is None or len(blob) != struct.calcsize("<3d"):
+            continue
+        raw = tuple(float(value) for value in struct.unpack("<3d", blob))
+        if not all(math.isfinite(value) for value in raw):
+            continue
+        # COLMAP coordinate-system value 0 stores WGS84 latitude, longitude,
+        # altitude. Other systems are already Cartesian metric coordinates.
+        positions[int(image_id)] = (
+            _geodetic_to_ecef(raw)
+            if int(coordinate_system) == 0
+            else np.asarray(raw, dtype=np.float64)
+        )
+    return positions
+
+
+def _top_indices(values: np.ndarray, count: int) -> np.ndarray:
+    count = min(max(0, int(count)), len(values))
+    if count <= 0:
+        return np.empty(0, dtype=np.int64)
+    if count == len(values):
+        return np.argsort(values)[::-1]
+    selected = np.argpartition(values, len(values) - count)[-count:]
+    return selected[np.argsort(values[selected])[::-1]]
+
+
+def _bridge_candidate_pairs(
+    database_path: Path,
+    *,
+    min_num_inliers: int,
+    retrieval_neighbors: int = 3,
+    gps_neighbors: int = 3,
+    gps_max_distance_m: float = 150.0,
+) -> tuple[list[tuple[str, str]], dict[str, object]]:
+    """Propose targeted cross-component pairs from retrieval and GPS priors."""
+
+    components = _database_verified_match_components(
+        database_path,
+        min_num_inliers=min_num_inliers,
+    )
+    image_rows = _database_images(database_path)
+    names = {image_id: name for image_id, _camera_id, name in image_rows}
+    if len(components) <= 1:
+        return [], {
+            "component_sizes": [len(component) for component in components],
+            "retrieval_pairs": 0,
+            "gps_pairs": 0,
+            "candidate_pairs": 0,
+        }
+
+    connection = sqlite3.connect(database_path)
+    try:
+        descriptors = _database_global_descriptor_means(connection)
+        positions = _database_pose_prior_positions(connection)
+    finally:
+        connection.close()
+
+    main = components[0]
+    main_descriptors = [image_id for image_id in main if image_id in descriptors]
+    descriptor_matrix = (
+        np.stack([descriptors[image_id] for image_id in main_descriptors])
+        if main_descriptors
+        else np.empty((0, 0), dtype=np.float32)
+    )
+    main_positions = [image_id for image_id in main if image_id in positions]
+    position_matrix = (
+        np.stack([positions[image_id] for image_id in main_positions])
+        if main_positions
+        else np.empty((0, 3), dtype=np.float64)
+    )
+
+    retrieval_pairs: set[tuple[int, int]] = set()
+    gps_pairs: set[tuple[int, int]] = set()
+    for component in components[1:]:
+        for image_id in component:
+            vector = descriptors.get(image_id)
+            if vector is not None and descriptor_matrix.shape[1:] == vector.shape:
+                similarities = descriptor_matrix @ vector
+                for index in _top_indices(similarities, retrieval_neighbors):
+                    retrieval_pairs.add(
+                        tuple(sorted((image_id, main_descriptors[int(index)])))
+                    )
+            position = positions.get(image_id)
+            if position is not None and len(position_matrix):
+                distances = np.linalg.norm(position_matrix - position, axis=1)
+                nearby = np.flatnonzero(distances <= float(gps_max_distance_m))
+                if len(nearby):
+                    order = nearby[np.argsort(distances[nearby])]
+                    for index in order[: max(0, int(gps_neighbors))]:
+                        gps_pairs.add(
+                            tuple(sorted((image_id, main_positions[int(index)])))
+                        )
+
+    combined = sorted(retrieval_pairs | gps_pairs)
+    pairs = [(names[first], names[second]) for first, second in combined]
+    return pairs, {
+        "component_sizes": [len(component) for component in components],
+        "retrieval_pairs": len(retrieval_pairs),
+        "gps_pairs": len(gps_pairs),
+        "candidate_pairs": len(combined),
+        "gps_max_distance_m": float(gps_max_distance_m),
+    }
+
+
+def _clear_database_image_pairs(
+    database_path: Path,
+    pairs: list[tuple[str, str]],
+) -> None:
+    """Remove failed raw rows only for verified bridge candidates before retry."""
+
+    if not pairs:
+        return
+    connection = sqlite3.connect(database_path)
+    try:
+        name_to_id = {
+            str(name): int(image_id)
+            for image_id, name in connection.execute(
+                "SELECT image_id, name FROM images"
+            )
+        }
+        pair_ids = [
+            _encode_colmap_pair_id(name_to_id[first], name_to_id[second])
+            for first, second in pairs
+            if first in name_to_id and second in name_to_id
+        ]
+        connection.executemany(
+            "DELETE FROM matches WHERE pair_id = ?",
+            [(pair_id,) for pair_id in pair_ids],
+        )
+        connection.executemany(
+            "DELETE FROM two_view_geometries WHERE pair_id = ?",
+            [(pair_id,) for pair_id in pair_ids],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _normalized_image_name(value: str) -> str:
     return value.replace("\\", "/").lstrip("./")
 
@@ -307,6 +597,8 @@ def _invalidate_colmap_outputs(root: Path) -> None:
         "pointcloud_ai_photogrammetry.ply",
         "sparse_ba.ply",
         "sparse_quality.json",
+        "matching_connectivity.json",
+        "cross_sequence_pairs.txt",
         "mapping.json",
         "pointcloud_output.json",
     ):
@@ -1415,6 +1707,8 @@ def run_colmap_ba_mvs(
     database = root / "database.db"
     mapped_root = root / "sparse_mapped"
     mapping_path = root / "mapping.json"
+    connectivity_path = root / "matching_connectivity.json"
+    bridge_pairs_path = root / "cross_sequence_pairs.txt"
     adjusted = root / "sparse_ba"
     dense = root / f"dense_{dense_fingerprint}"
     log_path = root / "photogrammetry.log"
@@ -1539,6 +1833,7 @@ def run_colmap_ba_mvs(
         for stage_name in (
             "ai_feature_extraction",
             "ai_feature_matching",
+            "cross_sequence_matching",
             "sparse_mapping",
             "bundle_adjustment",
             "sparse_output",
@@ -1718,6 +2013,182 @@ def run_colmap_ba_mvs(
         run_ai_matching,
     )
 
+    def connectivity_report_valid() -> bool:
+        if not connectivity_path.is_file():
+            return False
+        try:
+            report = json.loads(connectivity_path.read_text(encoding="utf-8"))
+            return (
+                int(report.get("algorithm_version", 0)) == 1
+                and int(report.get("image_count", -1)) == len(expected_names)
+                and int(report.get("verified_pair_count", -1))
+                == _database_verified_pair_count(
+                    database,
+                    min_num_inliers=min_num_inliers,
+                )
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    def invalidate_geometry_after_bridge(message: str) -> None:
+        for stage_name in (
+            "sparse_mapping",
+            "bundle_adjustment",
+            "sparse_output",
+        ):
+            sparse_stages.set(stage_name, "pending", message=message)
+        for stage_name in (
+            "image_undistortion",
+            "spatial_block_mvs",
+            "patch_match",
+            "stereo_fusion",
+            "pointcloud_output",
+        ):
+            dense_stages.set(stage_name, "pending", message=message)
+
+    def run_cross_sequence_matching() -> None:
+        before_components = _database_verified_match_components(
+            database,
+            min_num_inliers=min_num_inliers,
+        )
+        verified_before = _database_verified_pair_count(
+            database,
+            min_num_inliers=min_num_inliers,
+        )
+        pairs, candidate_report = _bridge_candidate_pairs(
+            database,
+            min_num_inliers=min_num_inliers,
+        )
+        if pairs:
+            bridge_pairs_path.write_text(
+                "".join(f"{first} {second}\n" for first, second in pairs),
+                encoding="utf-8",
+            )
+            # Sequential/LightGlue may have cached a zero-match row at a
+            # sequence boundary. Remove only these derived candidate rows so
+            # the wide-baseline fallback can genuinely retry them.
+            _clear_database_image_pairs(database, pairs)
+            if feature_type == "aliked":
+                bridge_matcher_type = "ALIKED_BRUTEFORCE"
+                bridge_model = _verified_colmap_ai_model(
+                    "bruteforce-matcher.onnx"
+                )
+                bridge_matcher_arguments = [
+                    "--AlikedMatching.bruteforce_model_path",
+                    str(bridge_model),
+                    "--AlikedMatching.brute_force_min_cossim",
+                    "0.50",
+                    "--AlikedMatching.brute_force_max_ratio",
+                    "0.98",
+                    "--AlikedMatching.brute_force_cross_check",
+                    "1",
+                ]
+            else:
+                bridge_matcher_type = "SIFT_BRUTEFORCE"
+                bridge_matcher_arguments = [
+                    "--SiftMatching.max_ratio",
+                    "0.90",
+                    "--SiftMatching.max_distance",
+                    "1.0",
+                    "--SiftMatching.cross_check",
+                    "1",
+                ]
+
+            def bridge_arguments(gpu: bool) -> list[str]:
+                return [
+                    "matches_importer",
+                    "--database_path",
+                    str(database),
+                    "--match_list_path",
+                    str(bridge_pairs_path),
+                    "--match_type",
+                    "pairs",
+                    "--FeatureMatching.type",
+                    bridge_matcher_type,
+                    "--FeatureMatching.use_gpu",
+                    "1" if gpu else "0",
+                    "--TwoViewGeometry.min_num_inliers",
+                    str(int(min_num_inliers)),
+                    "--TwoViewGeometry.max_error",
+                    str(float(ransac_max_error)),
+                    *bridge_matcher_arguments,
+                ]
+
+            try:
+                _run(executable, bridge_arguments(use_gpu), log_path)
+                ai_runtime["bridge_matching_device"] = (
+                    "cuda" if use_gpu else "cpu"
+                )
+            except RuntimeError as exc:
+                if not use_gpu:
+                    raise
+                _logger.warning(
+                    "Cross-sequence matching failed on CUDA; retrying on CPU: %s",
+                    exc,
+                )
+                ai_runtime["bridge_matching_device"] = "cpu_fallback"
+                ai_runtime.setdefault("fallbacks", []).append(
+                    "跨航线桥接匹配的CUDA Provider不可用，已自动切换CPU"
+                )
+                save_ai_runtime()
+                _run(executable, bridge_arguments(False), log_path)
+            save_ai_runtime()
+        elif bridge_pairs_path.is_file():
+            bridge_pairs_path.unlink()
+
+        after_components = _database_verified_match_components(
+            database,
+            min_num_inliers=min_num_inliers,
+        )
+        verified_after = _database_verified_pair_count(
+            database,
+            min_num_inliers=min_num_inliers,
+        )
+        report: dict[str, object] = {
+            "algorithm_version": 1,
+            "image_count": len(expected_names),
+            "components_before": [
+                len(component) for component in before_components
+            ],
+            "components_after": [len(component) for component in after_components],
+            "verified_pairs_before": int(verified_before),
+            "verified_pair_count": int(verified_after),
+            "new_verified_pairs": max(0, int(verified_after - verified_before)),
+            "connected": len(after_components) <= 1,
+            "pair_list": str(bridge_pairs_path) if pairs else "",
+            **candidate_report,
+        }
+        connectivity_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        mapped_registration = 0
+        if mapping_path.is_file():
+            try:
+                mapped_registration = int(
+                    json.loads(mapping_path.read_text(encoding="utf-8")).get(
+                        "registered_images", 0
+                    )
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                mapped_registration = 0
+        largest_after = len(after_components[0]) if after_components else 0
+        if verified_after > verified_before or (
+            mapped_registration and mapped_registration < largest_after
+        ):
+            invalidate_geometry_after_bridge(
+                "跨航线照片组已连接，自动废弃旧空三及其下游稠密成果"
+            )
+
+    run_stage(
+        "cross_sequence_matching",
+        0.28,
+        "跨航线检索、GPS邻域匹配与照片组自动桥接",
+        connectivity_report_valid,
+        run_cross_sequence_matching,
+    )
+
     def selected_mapped_model() -> Path | None:
         if not mapping_path.is_file():
             return None
@@ -1891,6 +2362,16 @@ def run_colmap_ba_mvs(
     )
 
     sparse_quality = json.loads(sparse_metadata_path.read_text(encoding="utf-8"))
+    try:
+        connectivity_report = json.loads(
+            connectivity_path.read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        connectivity_report = {
+            "components_before": [],
+            "components_after": [],
+            "connected": True,
+        }
     quality_gate = _evaluate_sparse_quality_gate(sparse_quality)
     mvs_selection = select_mvs_references(
         sparse_preview / "images.txt",
@@ -1908,6 +2389,16 @@ def run_colmap_ba_mvs(
         encoding="utf-8",
     )
     sparse_warnings: list[str] = []
+    components_before = list(connectivity_report.get("components_before", []))
+    components_after = list(connectivity_report.get("components_after", []))
+    if len(components_before) > 1 and len(components_after) == 1:
+        sparse_warnings.append(
+            "已通过图像检索、GPS邻域和几何验证自动连接分离照片组"
+        )
+    elif len(components_after) > 1:
+        sparse_warnings.append(
+            "照片仍分成多个互不连接的组；缺少共同可见区域时无法可靠自动合并"
+        )
     if float(sparse_quality["registration_ratio"]) < 0.8:
         sparse_warnings.append(
             f"仅注册 {sparse_quality['registered_images']}/{len(expected_names)} 张照片；"
@@ -1944,6 +2435,8 @@ def run_colmap_ba_mvs(
         "mean_track_length": sparse_quality.get("mean_track_length"),
         "median_track_length": sparse_quality.get("median_track_length"),
         "quality_gate": quality_gate,
+        "matching_connectivity": connectivity_report,
+        "matching_connectivity_report": str(connectivity_path),
         "mvs_reference_selection": mvs_selection,
         "mvs_reference_selection_report": str(mvs_selection_path),
         "matched_pairs": _database_count(database, "two_view_geometries"),

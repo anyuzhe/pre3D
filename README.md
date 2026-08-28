@@ -13,6 +13,7 @@
 → 照片质检、去重、关键帧筛选
 → ALIKED / SIFT 提取局部特征
 → LightGlue 匹配照片
+→ 跨航线图像检索、GPS邻域匹配与分离照片组自动桥接
 → GLOMAP 全局 SfM 或 COLMAP 增量 SfM
 → Bundle Adjustment
 → 空三质量闸门
@@ -45,6 +46,7 @@ pre3D 面向边坡、岩壁、隧道、无人机测绘、建筑外立面和近�
 - ALIKED‑N16Rot + LightGlue 推荐模式；
 - SIFT + LightGlue 兼容备选；
 - 全连接、顺序和自动匹配；
+- 自动检测分离照片组，并用外观检索、GPS邻域、ALIKED宽基线匹配和RANSAC几何验证进行跨航线桥接；
 - GLOMAP 全局 SfM、COLMAP 增量 SfM；
 - 相机模型、共享内参、特征数和原图 MVS 分辨率设置；
 - AI 特征、匹配、SfM、BA、去畸变、PatchMatch、融合逐阶段缓存；
@@ -130,10 +132,11 @@ AI 匹配模型存放在：
 checkpoints/colmap_ai/
 ├── aliked-n16rot.onnx
 ├── aliked-lightglue.onnx
+├── bruteforce-matcher.onnx
 └── sift-lightglue.onnx
 ```
 
-软件会校验三个模型的 SHA‑256，缺失或损坏时拒绝启动 AI 特征阶段。下载命令：
+软件会校验四个模型的 SHA‑256，缺失或损坏时拒绝启动对应的AI匹配阶段。下载命令：
 
 ```powershell
 .\scripts\download_colmap_ai_models.ps1

@@ -16,6 +16,11 @@ $Models = @(
         Sha256 = "b9a5de7204648b18a8cf5dcac819f9d30de1a5961ef03756803c8b86c2dceb8d"
     },
     @{
+        Name = "bruteforce-matcher.onnx"
+        Url = "https://github.com/colmap/colmap/releases/download/3.13.0/bruteforce-matcher.onnx"
+        Sha256 = "3c1282f96d83f5ffc861a873298d08bbe5219f59af59223f5ceab5c41a182a47"
+    },
+    @{
         Name = "sift-lightglue.onnx"
         Url = "https://github.com/colmap/colmap/releases/download/3.13.0/sift-lightglue.onnx"
         Sha256 = "e0500228472b43f92b3d36881a09b3310d3b058b56187b246cc7b9ab6429096e"

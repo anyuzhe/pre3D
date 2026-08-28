@@ -6,8 +6,11 @@ import numpy as np
 from PIL import Image
 
 from ai_photogrammetry.engineering.colmap_pipeline import (
+    _bridge_candidate_pairs,
+    _clear_database_image_pairs,
     _configure_patch_match,
     _cuda_out_of_memory,
+    _database_verified_match_components,
     _database_matches_images,
     _dense_map_valid,
     _estimate_dense_workspace_bytes,
@@ -166,6 +169,120 @@ def test_colmap_database_resume_requires_exact_image_names(tmp_path: Path):
         database,
         ["first.jpg", "second.jpg", "stale.jpg"],
     )
+
+
+def test_cross_sequence_bridge_candidates_join_disconnected_match_groups(
+    tmp_path: Path,
+):
+    database = tmp_path / "database.db"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE images(
+                image_id INTEGER PRIMARY KEY,
+                camera_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE descriptors(
+                image_id INTEGER PRIMARY KEY,
+                type INTEGER NOT NULL,
+                rows INTEGER NOT NULL,
+                cols INTEGER NOT NULL,
+                data BLOB
+            );
+            CREATE TABLE pose_priors(
+                corr_data_id INTEGER,
+                position BLOB,
+                coordinate_system INTEGER
+            );
+            CREATE TABLE matches(pair_id INTEGER PRIMARY KEY, rows INTEGER);
+            CREATE TABLE two_view_geometries(
+                pair_id INTEGER PRIMARY KEY,
+                rows INTEGER
+            );
+            """
+        )
+        connection.executemany(
+            "INSERT INTO images VALUES (?, 1, ?)",
+            [(1, "main_a.jpg"), (2, "main_b.jpg"),
+             (3, "flight_b_a.jpg"), (4, "flight_b_b.jpg")],
+        )
+        descriptor_vectors = {
+            1: np.asarray([[1.0, 0.0], [0.9, 0.1]], dtype="<f4"),
+            2: np.asarray([[0.0, 1.0], [0.1, 0.9]], dtype="<f4"),
+            3: np.asarray([[1.0, 0.0], [0.8, 0.2]], dtype="<f4"),
+            4: np.asarray([[0.0, 1.0], [0.2, 0.8]], dtype="<f4"),
+        }
+        connection.executemany(
+            "INSERT INTO descriptors VALUES (?, 1, 2, 8, ?)",
+            [(image_id, values.tobytes())
+             for image_id, values in descriptor_vectors.items()],
+        )
+        connection.executemany(
+            "INSERT INTO pose_priors VALUES (?, ?, 0)",
+            [
+                (1, struct.pack("<3d", 30.0, 120.0, 50.0)),
+                (2, struct.pack("<3d", 30.0, 120.0001, 50.0)),
+                (3, struct.pack("<3d", 30.00005, 120.0, 55.0)),
+                (4, struct.pack("<3d", 30.00005, 120.0001, 55.0)),
+            ],
+        )
+        pair_id = lambda first, second: (
+            min(first, second) * 2_147_483_647 + max(first, second)
+        )
+        connection.executemany(
+            "INSERT INTO two_view_geometries VALUES (?, 30)",
+            [(pair_id(1, 2),), (pair_id(3, 4),)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert [len(group) for group in _database_verified_match_components(
+        database,
+        min_num_inliers=20,
+    )] == [2, 2]
+    pairs, report = _bridge_candidate_pairs(
+        database,
+        min_num_inliers=20,
+        retrieval_neighbors=1,
+        gps_neighbors=1,
+        gps_max_distance_m=100.0,
+    )
+
+    assert report["component_sizes"] == [2, 2]
+    assert report["retrieval_pairs"] == 2
+    assert report["gps_pairs"] == 2
+    assert set(pairs) >= {
+        ("main_a.jpg", "flight_b_a.jpg"),
+        ("main_b.jpg", "flight_b_b.jpg"),
+    }
+
+    connection = sqlite3.connect(database)
+    try:
+        bridge_id = pair_id(1, 3)
+        unrelated_id = pair_id(1, 2)
+        connection.execute("INSERT INTO matches VALUES (?, 0)", (bridge_id,))
+        connection.execute(
+            "INSERT INTO matches VALUES (?, 30)", (unrelated_id,)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    _clear_database_image_pairs(database, [("main_a.jpg", "flight_b_a.jpg")])
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT rows FROM matches WHERE pair_id = ?", (bridge_id,)
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT rows FROM matches WHERE pair_id = ?", (unrelated_id,)
+        ).fetchone() == (30,)
+    finally:
+        connection.close()
 
 def test_corrupt_dense_map_is_detected_and_removed(tmp_path: Path):
     depth_maps = tmp_path / "dense" / "stereo" / "depth_maps"

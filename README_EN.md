@@ -23,6 +23,7 @@ Original full-resolution photographs
 → quality checks, duplicate detection, keyframe diagnostics
 → ALIKED or SIFT local features
 → LightGlue image matching and geometric verification
+→ cross-flight retrieval, GPS-neighbour matching, and disconnected-group bridging
 → GLOMAP global SfM or COLMAP incremental SfM
 → global bundle adjustment and sparse quality gate
 → image undistortion
@@ -41,6 +42,7 @@ VGG-T³ inference, checkpoints, training/evaluation code, and its direct point-m
 - Native PySide6 desktop UI with interactive PyVista/VTK point-cloud and mesh viewing.
 - Photo sharpness and EXIF inspection, exact/near-duplicate detection, sequence continuity checks, and keyframe diagnostics.
 - ALIKED-N16Rot + LightGlue as the recommended feature pipeline, with SIFT + LightGlue as a compatibility fallback.
+- Automatic disconnected match-graph detection with appearance retrieval, GPS-neighbour candidates, wide-baseline ALIKED fallback matching, and RANSAC verification across capture runs.
 - GLOMAP global SfM and COLMAP incremental SfM, including automatic fallback when registration quality is insufficient.
 - A sparse quality gate based on registered-image ratio, reprojection quality, camera layout, and point coverage.
 - Original-resolution CUDA PatchMatch Stereo with configurable source views, geometric consistency, filtering, and iterations.

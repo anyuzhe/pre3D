@@ -15,6 +15,7 @@ REQUIRED_RESOURCES = (
     "_internal/tools/colmap/bin/onnxruntime_providers_cuda.dll",
     "_internal/checkpoints/colmap_ai/aliked-n16rot.onnx",
     "_internal/checkpoints/colmap_ai/aliked-lightglue.onnx",
+    "_internal/checkpoints/colmap_ai/bruteforce-matcher.onnx",
     "_internal/checkpoints/colmap_ai/sift-lightglue.onnx",
 )
 

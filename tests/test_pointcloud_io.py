@@ -6,7 +6,7 @@ from ai_photogrammetry.engineering.exporters import write_binary_ply
 from ai_photogrammetry.engineering.pointcloud_io import load_ply_preview
 
 
-def test_binary_ply_preview_reads_distributed_blocks(tmp_path: Path):
+def test_binary_ply_preview_is_distributed_stable_and_not_periodic(tmp_path: Path):
     count = 10_000
     points = np.column_stack(
         (
@@ -33,9 +33,39 @@ def test_binary_ply_preview_reads_distributed_blocks(tmp_path: Path):
 
     assert total == count
     assert len(preview) == 100
-    assert preview[0, 0] == 0
-    assert preview[-1, 0] == count - 1
+    assert np.ptp(preview[:, 0]) > count * 0.9
+    assert len(np.unique(np.diff(np.sort(preview[:, 0])))) > 5
     assert preview_colors.shape == (100, 3)
+
+    repeated, repeated_colors, repeated_total = load_ply_preview(
+        path,
+        max_points=100,
+        block_count=10,
+    )
+    assert repeated_total == total
+    np.testing.assert_array_equal(repeated, preview)
+    np.testing.assert_array_equal(repeated_colors, preview_colors)
+
+
+def test_binary_ply_preview_does_not_return_long_scanline_bands(tmp_path: Path):
+    rows = 2_000
+    columns = 100
+    x, y = np.meshgrid(
+        np.arange(columns, dtype=np.float64),
+        np.arange(rows, dtype=np.float64),
+    )
+    points = np.column_stack((x.ravel(), y.ravel(), np.zeros(rows * columns)))
+    colors = np.full((len(points), 3), 120, dtype=np.uint8)
+    path = tmp_path / "scanline_ordered.ply"
+    write_binary_ply(path, points, colors, [])
+
+    preview, _preview_colors, total = load_ply_preview(path, max_points=4_000)
+
+    assert total == rows * columns
+    assert len(preview) == 4_000
+    # The old 128-contiguous-block reader exposed only about 128 scan rows and
+    # rendered them as obvious bands. Randomized strata cover many more rows.
+    assert len(np.unique(preview[:, 1])) > 500
 
 
 def test_binary_ply_preview_reads_all_small_cloud_points(tmp_path: Path):
