@@ -95,7 +95,28 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           QT_OPENGL: software
           PYVISTA_OFF_SCREEN: "true"
-        run: .\scripts\build_release.ps1 -Version $env:APP_VERSION
+        run: |
+          $buildLog = Join-Path $env:RUNNER_TEMP "pre3d-build.log"
+          try {
+            & .\scripts\build_release.ps1 -Version $env:APP_VERSION *>&1 |
+              Tee-Object -FilePath $buildLog
+          }
+          catch {
+            $_ | Out-String | Tee-Object -FilePath $buildLog -Append | Write-Host
+            $tail = Get-Content $buildLog -Tail 100 | Out-String
+            $annotation = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows installer build failed::$annotation"
+            throw
+          }
+
+      - name: Publish failed build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pre3D-Windows-build-diagnostics
+          path: ${{ runner.temp }}/pre3d-build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Publish workflow artifact
         uses: actions/upload-artifact@v7
