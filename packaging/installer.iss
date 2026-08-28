@@ -23,7 +23,10 @@ DefaultGroupName=岩创科技\{#AppName}
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
 OutputBaseFilename=岩土影像三维重建工作台-{#AppVersion}-Windows-x64-安装包
-Compression=lzma2/ultra64
+; The payload contains several gigabytes of already-compressed DLLs and model
+; files.  ultra64 saves little space here but can make every CI release take
+; tens of minutes longer; normal is the practical release-build preset.
+Compression=lzma2/normal
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
