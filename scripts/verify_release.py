@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -19,6 +20,14 @@ REQUIRED_RESOURCES = (
 
 
 def main() -> int:
+    # GitHub's Windows runner may expose a cp1252 console even though the
+    # repository and executable names are UTF-8.  Keep diagnostics readable
+    # instead of turning a successful verification into UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("release_dir", type=Path)
     args = parser.parse_args()
