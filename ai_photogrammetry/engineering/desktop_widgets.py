@@ -341,6 +341,23 @@ class CloudView(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self._headless = os.environ.get("PRE3D_HEADLESS_TEST", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._display_origin = np.zeros(3, dtype=np.float64)
+        if self._headless:
+            self.plotter = None
+            self._headless_label = QLabel(
+                "3D preview is disabled during the headless build test."
+            )
+            self._headless_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._headless_label.setStyleSheet(
+                "color: #b8c8cf; background: #0b1117; padding: 24px;"
+            )
+            layout.addWidget(self._headless_label)
+            return
         self.plotter = QtInteractor(self)
         layout.addWidget(self.plotter.interactor)
         self.plotter.set_background("#0b1117", top="#172832")
@@ -352,7 +369,6 @@ class CloudView(QWidget):
             name="hint",
         )
         self.plotter.show_axes()
-        self._display_origin = np.zeros(3, dtype=np.float64)
         self._enable_picking()
 
     def _enable_picking(self) -> None:
@@ -378,6 +394,12 @@ class CloudView(QWidget):
             self.point_picked.emit(value + self._display_origin)
 
     def clear(self) -> None:
+        if self._headless:
+            self._display_origin = np.zeros(3, dtype=np.float64)
+            self._headless_label.setText(
+                "3D preview is disabled during the headless build test."
+            )
+            return
         self.plotter.clear()
         self.plotter.add_text(
             "Point cloud appears after AI photogrammetry\nLeft click: pick a 3D point",
@@ -401,6 +423,12 @@ class CloudView(QWidget):
         label: str = "BA/MVS",
     ) -> None:
         """Display an exported PLY while preserving large engineering coordinates."""
+
+        if self._headless:
+            self._headless_label.setText(
+                f"Headless point-cloud check: {Path(path).name} ({unit})"
+            )
+            return
 
         points, colors, total_points = load_ply_preview(
             path,
@@ -507,6 +535,11 @@ class CloudView(QWidget):
 
         if not blocks:
             raise ValueError("多图集模型没有可显示的纹理块")
+        if self._headless:
+            self._headless_label.setText(
+                f"Headless textured-model check: {len(blocks)} atlas block(s) ({unit})"
+            )
+            return
         loaded: list[tuple[pv.PolyData, object, np.ndarray]] = []
         finite_points: list[np.ndarray] = []
         total_vertices = 0
@@ -562,7 +595,8 @@ class CloudView(QWidget):
         self.plotter.render()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self.plotter.close()
+        if self.plotter is not None:
+            self.plotter.close()
         super().closeEvent(event)
 
 

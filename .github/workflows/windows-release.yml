@@ -23,10 +23,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           architecture: x64
@@ -51,11 +51,23 @@ jobs:
         shell: pwsh
         run: .\scripts\setup.ps1 -PythonCommand python
 
-      - name: Run automated tests
+      - name: Run unit and workflow tests
         shell: pwsh
-        run: |
-          .\.venv\Scripts\python.exe -m pytest -q
-          .\.venv\Scripts\python.exe app.py --smoke-test
+        env:
+          PRE3D_HEADLESS_TEST: "1"
+          QT_QPA_PLATFORM: offscreen
+          QT_OPENGL: software
+          PYVISTA_OFF_SCREEN: "true"
+        run: .\.venv\Scripts\python.exe -m pytest -q
+
+      - name: Run headless desktop smoke test
+        shell: pwsh
+        env:
+          PRE3D_HEADLESS_TEST: "1"
+          QT_QPA_PLATFORM: offscreen
+          QT_OPENGL: software
+          PYVISTA_OFF_SCREEN: "true"
+        run: .\.venv\Scripts\python.exe app.py --smoke-test
 
       - name: Download COLMAP CUDA runtime
         shell: pwsh
@@ -78,10 +90,15 @@ jobs:
 
       - name: Build and verify Windows installer
         shell: pwsh
+        env:
+          PRE3D_HEADLESS_TEST: "1"
+          QT_QPA_PLATFORM: offscreen
+          QT_OPENGL: software
+          PYVISTA_OFF_SCREEN: "true"
         run: .\scripts\build_release.ps1 -Version $env:APP_VERSION
 
       - name: Publish workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pre3D-${{ env.APP_VERSION }}-Windows-x64
           path: |
