@@ -103,8 +103,9 @@ jobs:
           }
           catch {
             $_ | Out-String | Tee-Object -FilePath $buildLog -Append | Write-Host
-            $tail = Get-Content $buildLog -Tail 100 | Out-String
-            $annotation = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            $failure = "Exception: $($_.Exception.Message)`n`nLast 30 build lines:`n"
+            $tail = Get-Content $buildLog -Tail 30 | Out-String
+            $annotation = ($failure + $tail).Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=Windows installer build failed::$annotation"
             throw
           }
