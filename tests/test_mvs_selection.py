@@ -59,3 +59,24 @@ def test_all_reference_strategy_keeps_every_registered_image(tmp_path: Path):
     assert selection["reference_image_count"] == 5
     assert selection["helper_source_image_count"] == 0
     assert selection["sparse_point_coverage_ratio"] == 1.0
+
+
+def test_all_reference_strategy_skips_pose_only_images(tmp_path: Path):
+    images = tmp_path / "images.txt"
+    _write_sparse_images(images)
+    with images.open("a", encoding="utf-8") as stream:
+        stream.write("6 1 0 0 0 6 0 0 1 pose_only.jpg\n")
+        stream.write("10.0 20.0 -1 30.0 40.0 -1\n")
+
+    selection = select_mvs_references(
+        images,
+        reference_ratio=1.0,
+        strategy="all",
+    )
+
+    assert selection["registered_image_count"] == 6
+    assert selection["depth_supported_image_count"] == 5
+    assert selection["reference_image_count"] == 5
+    assert selection["helper_source_image_count"] == 1
+    assert selection["excluded_reference_images"] == ["pose_only.jpg"]
+    assert "pose_only.jpg" not in selection["reference_images"]

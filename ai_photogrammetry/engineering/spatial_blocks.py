@@ -39,6 +39,11 @@ _FUSED_DTYPE = np.dtype(
     align=False,
 )
 
+SPATIAL_BLOCK_PLAN_VERSION = 3
+_DENSE_CORE_MARGIN_RATIO = 0.10
+_MINIMUM_CORE_REFERENCE_OBSERVATIONS = 2
+_TARGET_CORE_REFERENCE_COVERAGE = 0.95
+
 
 @dataclass(frozen=True)
 class _Leaf:
@@ -109,6 +114,98 @@ def _ranked_image_names_for_points(
     if limit is not None:
         selected = selected[: max(3, int(limit))]
     return selected
+
+
+def _augment_reference_coverage(
+    reference_names: Sequence[str],
+    candidate_names: Sequence[str],
+    core_point_ids: set[int],
+    views_by_name: dict[str, SparseView],
+    *,
+    minimum_observations: int = _MINIMUM_CORE_REFERENCE_OBSERVATIONS,
+    target_coverage: float = _TARGET_CORE_REFERENCE_COVERAGE,
+) -> tuple[list[str], float, float, int]:
+    """Add local references until most Core points have multi-view support.
+
+    A globally unique depth-map owner is economical, but it is not sufficient
+    for spatial MVS: an image can observe several neighbouring Core blocks and
+    StereoFusion needs at least two reference depth maps in the block that owns
+    a surface.  This greedy coverage pass promotes only the useful Halo views
+    and therefore avoids falling back to recomputing every image in every
+    block.
+    """
+
+    if minimum_observations < 1:
+        raise ValueError("Core参考视图最少观测数必须大于0")
+    if not 0.0 < target_coverage <= 1.0:
+        raise ValueError("Core参考视图覆盖率必须在0～1之间")
+    if not core_point_ids:
+        return list(dict.fromkeys(reference_names)), 0.0, 1.0, 0
+
+    ordered_points = sorted(core_point_ids)
+    point_positions = {
+        point_id: index for index, point_id in enumerate(ordered_points)
+    }
+    selected = list(dict.fromkeys(reference_names))
+    selected_keys = {name.casefold() for name in selected}
+    observations = np.zeros(len(ordered_points), dtype=np.int16)
+    candidate_indices: dict[str, np.ndarray] = {}
+
+    for name in dict.fromkeys([*selected, *candidate_names]):
+        view = views_by_name.get(name.casefold())
+        if view is None or not view.point_ids:
+            continue
+        indices = np.fromiter(
+            (
+                point_positions[point_id]
+                for point_id in view.point_ids
+                if point_id in point_positions
+            ),
+            dtype=np.int64,
+        )
+        if len(indices):
+            candidate_indices[name] = indices
+            if name.casefold() in selected_keys:
+                observations[indices] += 1
+
+    def coverage_ratio() -> float:
+        return float(np.mean(observations >= minimum_observations))
+
+    base_count = len(selected)
+    candidates = sorted(
+        (
+            name
+            for name in candidate_names
+            if name.casefold() not in selected_keys and name in candidate_indices
+        ),
+        key=str.casefold,
+    )
+    while candidates and coverage_ratio() < target_coverage:
+        best_name = ""
+        best_score = (-1, -1, -1)
+        for name in candidates:
+            indices = candidate_indices[name]
+            score = (
+                int(np.count_nonzero(observations[indices] == minimum_observations - 1)),
+                int(np.count_nonzero(observations[indices] < minimum_observations)),
+                int(len(indices)),
+            )
+            if score > best_score:
+                best_name = name
+                best_score = score
+        if not best_name or best_score[1] <= 0:
+            break
+        observations[candidate_indices[best_name]] += 1
+        selected.append(best_name)
+        selected_keys.add(best_name.casefold())
+        candidates.remove(best_name)
+
+    return (
+        selected,
+        coverage_ratio(),
+        float(np.mean(observations == 0)),
+        len(selected) - base_count,
+    )
 
 
 def plan_spatial_blocks(
@@ -254,17 +351,24 @@ def plan_spatial_blocks(
     for block_index, leaf in enumerate(leaves, start=1):
         core_lower = leaf.lower.copy()
         core_upper = leaf.upper.copy()
-        core_lower[split_dimensions:] = global_lower[split_dimensions:]
-        core_upper[split_dimensions:] = global_upper[split_dimensions:]
+        # Only the PCA split dimensions partition ownership.  Dense geometry
+        # regularly extends beyond the sparse model's thickness/height bounds,
+        # so those non-partition dimensions must include the same safety margin
+        # that is used while selecting Halo views.  Otherwise valid rock faces
+        # are calculated and then silently clipped from every Core output.
+        core_lower[split_dimensions:] = (
+            global_lower[split_dimensions:]
+            - extent[split_dimensions:] * _DENSE_CORE_MARGIN_RATIO
+        )
+        core_upper[split_dimensions:] = (
+            global_upper[split_dimensions:]
+            + extent[split_dimensions:] * _DENSE_CORE_MARGIN_RATIO
+        )
         halo_lower = core_lower.copy()
         halo_upper = core_upper.copy()
         block_extent = np.maximum(core_upper - core_lower, extent * 1e-6)
         halo_lower[:split_dimensions] -= block_extent[:split_dimensions] * halo_ratio
         halo_upper[:split_dimensions] += block_extent[:split_dimensions] * halo_ratio
-        # Dense points can extend beyond the sparse surface thickness, so the
-        # non-partition dimensions receive a small global safety margin.
-        halo_lower[split_dimensions:] -= extent[split_dimensions:] * 0.10
-        halo_upper[split_dimensions:] += extent[split_dimensions:] * 0.10
         halo_mask = np.all(
             (local >= halo_lower - 1e-9) & (local <= halo_upper + 1e-9),
             axis=1,
@@ -371,6 +475,8 @@ def plan_spatial_blocks(
         reference_lists[best_index].append(view.name)
         loads[best_index] += 1
 
+    views_by_name = {view.name.casefold(): view for view in views}
+    achieved_coverages: list[float] = []
     for index, references in enumerate(reference_lists):
         if len(references) < 3:
             raise RuntimeError(
@@ -379,15 +485,33 @@ def plan_spatial_blocks(
             )
         local_images = set(str(value) for value in blocks[index]["image_names"])
         local_images.update(references)
+        (
+            references,
+            achieved_coverage,
+            zero_coverage,
+            augmentation_count,
+        ) = _augment_reference_coverage(
+            references,
+            sorted(local_images, key=str.casefold),
+            block_core_points[index],
+            views_by_name,
+        )
+        achieved_coverages.append(achieved_coverage)
         blocks[index]["image_names"] = sorted(local_images, key=str.casefold)
         blocks[index]["image_count"] = len(local_images)
         blocks[index]["reference_images"] = sorted(references, key=str.casefold)
         blocks[index]["reference_image_count"] = len(references)
+        blocks[index]["base_reference_image_count"] = (
+            len(references) - augmentation_count
+        )
+        blocks[index]["reference_augmentation_count"] = augmentation_count
+        blocks[index]["core_reference_coverage_ratio"] = achieved_coverage
+        blocks[index]["core_reference_zero_ratio"] = zero_coverage
     assigned_images = set().union(
         *(set(str(value) for value in block["image_names"]) for block in blocks)
     )
     payload = {
-        "version": 2,
+        "version": SPATIAL_BLOCK_PLAN_VERSION,
         "strategy": "pca_corridor" if corridor else "pca_adaptive_surface",
         "coordinate_frame": {
             "center": center.tolist(),
@@ -406,6 +530,25 @@ def plan_spatial_blocks(
         "total_reference_image_assignments": int(
             sum(block["reference_image_count"] for block in blocks)
         ),
+        "unique_reference_image_count": int(
+            len(
+                set().union(
+                    *(
+                        set(str(value) for value in block["reference_images"])
+                        for block in blocks
+                    )
+                )
+            )
+        ),
+        "minimum_core_reference_observations": (
+            _MINIMUM_CORE_REFERENCE_OBSERVATIONS
+        ),
+        "target_core_reference_coverage_ratio": (
+            _TARGET_CORE_REFERENCE_COVERAGE
+        ),
+        "minimum_achieved_core_reference_coverage_ratio": (
+            min(achieved_coverages) if achieved_coverages else 0.0
+        ),
         "blocks": blocks,
     }
     return payload
@@ -422,12 +565,17 @@ def write_block_patch_match_config(
     *,
     source_count: int,
     source_image_names: Sequence[str] | None = None,
+    stable_source_image_names: Sequence[str] | None = None,
+    minimum_stable_sources: int = 3,
 ) -> int:
     """Write explicit Core-reference/Halo-source lists for one spatial block.
 
     Reference views own depth maps in this block. The wider source pool may
     include neighbouring Halo views, but those views are not promoted to
-    references. This avoids recomputing depth maps in overlapping blocks.
+    references. ``stable_source_image_names`` identifies views whose
+    photometric maps are guaranteed to exist during geometric consistency.
+    Keeping a few of those sources in every row prevents a reference from
+    losing all sources after completed blocks have released their dense maps.
     """
 
     view_lookup = {view.name.casefold(): view for view in views}
@@ -436,8 +584,16 @@ def write_block_patch_match_config(
     )
     source_names = source_image_names or reference_image_names
     source_keys = list(dict.fromkeys(name.casefold() for name in source_names))
+    stable_names = stable_source_image_names or reference_image_names
+    stable_keys = {
+        name.casefold()
+        for name in stable_names
+        if name.casefold() in view_lookup
+    }
     references = [
-        view_lookup[key] for key in reference_keys if key in view_lookup
+        view_lookup[key]
+        for key in reference_keys
+        if key in view_lookup and view_lookup[key].point_ids
     ]
     source_views = [view_lookup[key] for key in source_keys if key in view_lookup]
     missing_references = [
@@ -450,7 +606,7 @@ def write_block_patch_match_config(
             "空间块参考照片不在稀疏模型中：" + "、".join(missing_references[:5])
         )
     if not references:
-        raise RuntimeError("空间块没有可用的参考照片")
+        raise RuntimeError("空间块没有具备稀疏点深度约束的参考照片")
     if len(source_views) < 2:
         raise RuntimeError("空间块内可用的源照片少于2张")
     rows: list[str] = []
@@ -468,7 +624,34 @@ def write_block_patch_match_config(
             candidates.append((shared, -sequence_distance, candidate.name))
         candidates.sort(reverse=True)
         count = min(max(1, int(source_count)), len(candidates))
-        candidate_names = [value[2] for value in candidates[:count]]
+        stable_candidates = [
+            value for value in candidates if value[2].casefold() in stable_keys
+        ]
+        # Prefer every source whose photometric map is guaranteed to exist,
+        # not merely the minimum safety quota.  Filling the remaining slots
+        # with higher-ranked Halo views that do not own a map makes COLMAP
+        # silently skip the most useful cross-block sources during geometric
+        # consistency and can leave visible holes at Core boundaries.
+        stable_count = min(count, len(stable_candidates))
+        selected = stable_candidates[:stable_count]
+        selected_keys = {value[2].casefold() for value in selected}
+        for value in candidates:
+            if len(selected) >= count:
+                break
+            if value[2].casefold() in selected_keys:
+                continue
+            selected.append(value)
+            selected_keys.add(value[2].casefold())
+        required_stable = min(
+            max(0, int(minimum_stable_sources)),
+            count,
+            len(stable_candidates),
+        )
+        if sum(
+            value[2].casefold() in stable_keys for value in selected
+        ) < required_stable:
+            raise RuntimeError("空间块稳定源照片数不足")
+        candidate_names = [value[2] for value in selected]
         rows.extend((reference.name, ", ".join(candidate_names)))
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)

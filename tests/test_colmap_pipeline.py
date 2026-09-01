@@ -12,13 +12,16 @@ from ai_photogrammetry.engineering.colmap_pipeline import (
     _cuda_out_of_memory,
     _database_verified_match_components,
     _database_matches_images,
+    _dense_map_pair_valid,
     _dense_map_valid,
     _estimate_dense_workspace_bytes,
     _evaluate_sparse_quality_gate,
     _fusion_resources,
+    _last_spatial_image_use,
     _merge_colmap_fused_plys,
     _plan_fusion_batches,
     _patch_match_dependency_arguments,
+    _pending_dense_reference_images,
     _prepare_colmap_image_paths,
     _ply_vertex_count,
     _remove_invalid_dense_maps,
@@ -301,6 +304,36 @@ def test_corrupt_dense_map_is_detected_and_removed(tmp_path: Path):
     assert not corrupt.exists()
 
 
+def test_partial_dense_resume_requires_both_depth_and_normal_maps(
+    tmp_path: Path,
+):
+    dense = tmp_path / "dense"
+    depth = dense / "stereo" / "depth_maps"
+    normal = dense / "stereo" / "normal_maps"
+    depth.mkdir(parents=True)
+    normal.mkdir()
+
+    def write_map(path: Path, channels: int) -> None:
+        header = f"3&2&{channels}&".encode("ascii")
+        path.write_bytes(header + bytes(3 * 2 * channels * 4))
+
+    write_map(depth / "complete.jpg.geometric.bin", 1)
+    write_map(normal / "complete.jpg.geometric.bin", 3)
+    write_map(depth / "missing-normal.jpg.geometric.bin", 1)
+
+    assert _dense_map_pair_valid(dense, "complete.jpg", "geometric")
+    assert not _dense_map_pair_valid(
+        dense,
+        "missing-normal.jpg",
+        "geometric",
+    )
+    assert _pending_dense_reference_images(
+        dense,
+        ["complete.jpg", "missing-normal.jpg"],
+        "geometric",
+    ) == ["missing-normal.jpg"]
+
+
 def test_dense_workspace_estimate_scales_with_resolution(tmp_path: Path):
     image = tmp_path / "large.jpg"
     Image.fromarray(np.zeros((1200, 1600, 3), dtype=np.uint8)).save(image)
@@ -356,6 +389,49 @@ def test_photometric_maps_are_removed_after_geometric_patchmatch(
     assert not (normal / "a.photometric.bin").exists()
     assert (depth / "a.geometric.bin").is_file()
     assert (normal / "a.geometric.bin").is_file()
+
+
+def test_photometric_cleanup_can_retain_future_spatial_references(
+    tmp_path: Path,
+):
+    stereo = tmp_path / "dense" / "stereo"
+    depth = stereo / "depth_maps"
+    normal = stereo / "normal_maps"
+    depth.mkdir(parents=True)
+    normal.mkdir()
+    for folder in (depth, normal):
+        (folder / "finished.jpg.photometric.bin").write_bytes(b"finished")
+        (folder / "future.jpg.photometric.bin").write_bytes(b"future")
+
+    removed, _ = _remove_photometric_maps_after_geometric_patchmatch(
+        tmp_path / "dense",
+        ["finished.jpg"],
+    )
+
+    assert removed == 2
+    assert not (depth / "finished.jpg.photometric.bin").exists()
+    assert not (normal / "finished.jpg.photometric.bin").exists()
+    assert (depth / "future.jpg.photometric.bin").is_file()
+    assert (normal / "future.jpg.photometric.bin").is_file()
+
+
+def test_spatial_map_lifetime_includes_future_source_only_use():
+    blocks = [
+        {
+            "image_names": ["owner.jpg", "shared.jpg"],
+            "reference_images": ["owner.jpg", "shared.jpg"],
+        },
+        {
+            "image_names": ["shared.jpg", "next.jpg"],
+            "reference_images": ["next.jpg"],
+        },
+    ]
+
+    last_use = _last_spatial_image_use(blocks)
+
+    assert last_use["owner.jpg"] == 1
+    assert last_use["shared.jpg"] == 2
+    assert last_use["next.jpg"] == 2
 
 
 def test_cuda_oom_detection_is_specific():

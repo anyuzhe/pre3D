@@ -30,6 +30,7 @@ from .project_store import StageTracker, source_fingerprint
 from .runtime_paths import executable_root, resource_root
 from .session import ProjectSession
 from .spatial_blocks import (
+    SPATIAL_BLOCK_PLAN_VERSION,
     crop_fused_ply_to_core,
     plan_spatial_blocks,
     save_spatial_plan,
@@ -46,6 +47,7 @@ _COLMAP_AI_MODELS = {
 }
 
 _COLMAP_PAIR_ID_MAX = 2_147_483_647
+_SPATIAL_SOURCE_MAP_POLICY_VERSION = 2
 
 
 def _runtime_library_directories(executable: str) -> list[str]:
@@ -759,6 +761,35 @@ def _dense_map_valid(path: Path) -> bool:
         return False
 
 
+def _dense_map_pair_valid(
+    dense: Path,
+    image_name: str,
+    input_type: str,
+) -> bool:
+    """Return whether one image has complete depth and normal maps."""
+
+    return all(
+        _dense_map_valid(
+            dense / "stereo" / folder / f"{image_name}.{input_type}.bin"
+        )
+        for folder in ("depth_maps", "normal_maps")
+    )
+
+
+def _pending_dense_reference_images(
+    dense: Path,
+    image_names: list[str],
+    input_type: str,
+) -> list[str]:
+    """Select only incomplete references for a resumable PatchMatch run."""
+
+    return [
+        name
+        for name in image_names
+        if not _dense_map_pair_valid(dense, name, input_type)
+    ]
+
+
 def _remove_invalid_dense_maps(dense: Path) -> list[str]:
     removed: list[str] = []
     stereo = dense / "stereo"
@@ -1023,6 +1054,7 @@ def _cuda_out_of_memory(error: BaseException) -> bool:
 
 def _remove_photometric_maps_after_geometric_patchmatch(
     dense: Path,
+    image_names: list[str] | None = None,
 ) -> tuple[int, int]:
     """Free maps that geometric StereoFusion will never read."""
 
@@ -1032,7 +1064,14 @@ def _remove_photometric_maps_after_geometric_patchmatch(
         folder = dense / "stereo" / folder_name
         if not folder.is_dir():
             continue
-        for path in folder.glob("*.photometric.bin"):
+        paths = (
+            [folder / f"{name}.photometric.bin" for name in image_names]
+            if image_names is not None
+            else list(folder.glob("*.photometric.bin"))
+        )
+        for path in paths:
+            if not path.is_file():
+                continue
             try:
                 size = path.stat().st_size
                 path.unlink()
@@ -1063,6 +1102,18 @@ def _remove_dense_maps_for_images(dense: Path, image_names: list[str]) -> int:
                 except OSError:
                     pass
     return removed_bytes
+
+
+def _last_spatial_image_use(blocks: list[dict[str, object]]) -> dict[str, int]:
+    """Return the final block that may consume each image's dense maps."""
+
+    last_use: dict[str, int] = {}
+    for block_index, block in enumerate(blocks, start=1):
+        names = [str(value) for value in block.get("image_names", [])]
+        names.extend(str(value) for value in block.get("reference_images", []))
+        for name in names:
+            last_use[name] = block_index
+    return last_use
 
 
 def _spatial_dense_workspace_estimate(
@@ -1130,6 +1181,7 @@ def _run_spatial_block_mvs(
     center = frame["center"]
     basis = frame["basis"]
     views = read_sparse_views(sparse_preview / "images.txt")
+    view_lookup = {view.name.casefold(): view for view in views}
     registered_count = len(views)
     block_tracker = StageTracker(block_root / "pipeline_state.json")
     fusion_config = dense / "stereo" / "fusion.cfg"
@@ -1138,6 +1190,20 @@ def _run_spatial_block_mvs(
     fusion_cache_size_gb, fusion_num_threads = _fusion_resources()
     core_outputs: list[Path] = []
     effective_sources: list[int] = []
+    configured_reference_names: set[str] = set()
+    excluded_reference_names: set[str] = set()
+    # Dense maps are dependencies of both reference and source views.  Their
+    # lifetime must therefore extend through the last block in which the image
+    # can be selected as either role.  Tracking only reference ownership caused
+    # a block-6 map to be deleted before block 7 used it for consistency.
+    last_dense_map_use = {
+        name: last_use
+        for name, last_use in _last_spatial_image_use(blocks).items()
+        if (
+            name.casefold() in view_lookup
+            and view_lookup[name.casefold()].point_ids
+        )
+    }
 
     def update(value: float, text: str) -> None:
         if progress_callback:
@@ -1147,26 +1213,79 @@ def _run_spatial_block_mvs(
         block = dict(raw_block)
         block_id = str(block["id"])
         image_names = [str(value) for value in block["image_names"]]
-        reference_images = [
+        requested_reference_images = [
             str(value) for value in block.get("reference_images", image_names)
         ]
+        reference_images = [
+            name
+            for name in requested_reference_images
+            if (
+                name.casefold() in view_lookup
+                and view_lookup[name.casefold()].point_ids
+            )
+        ]
+        excluded_references = [
+            name for name in requested_reference_images if name not in reference_images
+        ]
+        configured_reference_names.update(reference_images)
+        excluded_reference_names.update(excluded_references)
+        if len(reference_images) < 3:
+            raise RuntimeError(
+                f"空间块 {block_id} 具备稀疏点深度约束的参考照片少于3张"
+            )
         directory = block_root / block_id
         directory.mkdir(parents=True, exist_ok=True)
         raw_fused = directory / "halo_fused.ply"
         core_fused = directory / "core_fused.ply"
         core_outputs.append(core_fused)
+        block_signature = hashlib.sha256(
+            json.dumps(
+                {
+                    "plan_version": int(plan.get("version", 0)),
+                    "source_map_policy_version": (
+                        _SPATIAL_SOURCE_MAP_POLICY_VERSION
+                    ),
+                    "images": image_names,
+                    "references": reference_images,
+                    "core_lower": block["core_lower"],
+                    "core_upper": block["core_upper"],
+                    "geometric_consistency": bool(geometric_consistency),
+                    "patch_match_filter": bool(patch_match_filter),
+                    "source_images": int(patch_match_source_images),
+                    "iterations": int(patch_match_iterations),
+                    "max_image_size": int(max_image_size),
+                    "fusion_min_num_pixels": int(fusion_min_num_pixels),
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        previous_details = dict(
+            block_tracker.data.get("stages", {})
+            .get(block_id, {})
+            .get("details")
+            or {}
+        )
         try:
             reusable = _colmap_fused_ply_info(core_fused)[0] > 0
         except RuntimeError:
             reusable = False
             _remove_stereo_fusion_output(core_fused)
-        if reusable and block_tracker.status(block_id) == "completed":
-            _remove_dense_maps_for_images(dense, reference_images)
-            details = dict(
-                block_tracker.data.get("stages", {}).get(block_id, {}).get("details")
-                or {}
+        reusable = bool(
+            reusable
+            and block_tracker.status(block_id) == "completed"
+            and previous_details.get("block_signature") == block_signature
+        )
+        releasable_dense_maps = [
+            name
+            for name, last_use in last_dense_map_use.items()
+            if last_use == block_index
+        ]
+        if reusable:
+            _remove_dense_maps_for_images(dense, releasable_dense_maps)
+            effective_sources.append(
+                int(previous_details.get("source_images", patch_match_source_images))
             )
-            effective_sources.append(int(details.get("source_images", patch_match_source_images)))
             update(
                 0.64 + 0.28 * block_index / len(blocks),
                 f"恢复空间块 {block_index}/{len(blocks)}：已完成",
@@ -1180,6 +1299,8 @@ def _run_spatial_block_mvs(
             details={
                 "image_count": len(image_names),
                 "reference_image_count": len(reference_images),
+                "excluded_reference_images": excluded_references,
+                "block_signature": block_signature,
             },
         )
         source_attempts = list(
@@ -1195,14 +1316,41 @@ def _run_spatial_block_mvs(
         effective_source_count = source_attempts[0]
         try:
             _remove_invalid_dense_maps(dense)
+            pending_references = _pending_dense_reference_images(
+                dense,
+                reference_images,
+                input_type,
+            )
+            photometric_ready = [
+                name
+                for name in image_names
+                if _dense_map_pair_valid(dense, name, "photometric")
+            ]
+            # Pending references are processed photometrically before the
+            # geometric phase in the same COLMAP invocation. Previously
+            # completed photometric references can therefore join them as
+            # guaranteed geometric sources during a partial resume.
+            stable_source_images = list(
+                dict.fromkeys([*photometric_ready, *pending_references])
+            )
+            if pending_references and len(pending_references) < len(reference_images):
+                update(
+                    0.64 + 0.22 * (block_index - 1) / len(blocks),
+                    f"恢复空间块 {block_index}/{len(blocks)}："
+                    f"仅补算 {len(pending_references)}/{len(reference_images)} 张",
+                )
             for attempt_index, source_count in enumerate(source_attempts):
+                if not pending_references:
+                    break
                 effective_source_count = source_count
                 configured = write_block_patch_match_config(
                     patch_config,
-                    reference_images,
+                    pending_references,
                     views,
                     source_count=source_count,
                     source_image_names=image_names,
+                    stable_source_image_names=stable_source_images,
+                    minimum_stable_sources=3,
                 )
                 patch_args = [
                     "patch_match_stereo",
@@ -1246,6 +1394,18 @@ def _run_spatial_block_mvs(
                     break
                 except Exception as exc:
                     _remove_invalid_dense_maps(dense)
+                    completed_after_failure = not _pending_dense_reference_images(
+                        dense,
+                        pending_references,
+                        input_type,
+                    )
+                    if completed_after_failure:
+                        _logger.warning(
+                            "COLMAP exited abnormally after writing every requested "
+                            "dense map; accepting validated outputs: %s",
+                            exc,
+                        )
+                        break
                     has_retry = attempt_index + 1 < len(source_attempts)
                     if not (use_gpu and has_retry and _cuda_out_of_memory(exc)):
                         raise
@@ -1255,17 +1415,25 @@ def _run_spatial_block_mvs(
                         f"空间块显存不足，源照片数 {source_count}→{next_count} 后重试",
                     )
 
-            expected_maps = [
-                dense / "stereo" / "depth_maps" / f"{name}.{input_type}.bin"
-                for name in reference_images
-            ]
-            if not all(_dense_map_valid(path) for path in expected_maps):
-                missing = [path.name for path in expected_maps if not _dense_map_valid(path)]
+            missing = _pending_dense_reference_images(
+                dense,
+                reference_images,
+                input_type,
+            )
+            if missing:
                 raise RuntimeError(
-                    f"空间块 {block_id} 深度图不完整：" + "、".join(missing[:5])
+                    f"空间块 {block_id} 深度图或法向图不完整："
+                    + "、".join(missing[:5])
                 )
             if geometric_consistency:
-                _remove_photometric_maps_after_geometric_patchmatch(dense)
+                # References promoted into a neighbouring Core are reused
+                # there. Keep both their photometric and geometric maps until
+                # the last owning block, otherwise geometric consistency in a
+                # later block can lose every valid source dependency.
+                _remove_photometric_maps_after_geometric_patchmatch(
+                    dense,
+                    releasable_dense_maps,
+                )
             _write_fusion_config(fusion_config, reference_images)
             _remove_stereo_fusion_output(raw_fused)
             update(
@@ -1321,10 +1489,12 @@ def _run_spatial_block_mvs(
                 details={
                     "image_count": len(image_names),
                     "reference_image_count": len(reference_images),
+                    "excluded_reference_images": excluded_references,
                     "source_images": int(effective_source_count),
                     "halo_point_count": int(raw_count),
                     "core_point_count": int(core_count),
                     "output": str(core_fused),
+                    "block_signature": block_signature,
                 },
             )
             effective_sources.append(effective_source_count)
@@ -1334,7 +1504,7 @@ def _run_spatial_block_mvs(
         finally:
             _remove_stereo_fusion_output(raw_fused)
             if core_fused.is_file():
-                _remove_dense_maps_for_images(dense, reference_images)
+                _remove_dense_maps_for_images(dense, releasable_dense_maps)
 
     update(0.925, f"合并 {len(core_outputs)} 个空间Core点云")
     partial = fused.with_suffix(".spatial-merging.ply")
@@ -1352,8 +1522,14 @@ def _run_spatial_block_mvs(
         "effective_source_images": (
             int(min(effective_sources)) if effective_sources else int(patch_match_source_images)
         ),
+        "configured_reference_image_count": len(configured_reference_names),
+        "excluded_reference_image_count": len(excluded_reference_names),
+        "excluded_reference_images": sorted(
+            excluded_reference_names, key=str.casefold
+        ),
         "workspace_strategy": "shared_undistorted_workspace_core_halo_blocks",
         "depth_maps_retained": False,
+        "source_map_policy_version": _SPATIAL_SOURCE_MAP_POLICY_VERSION,
     }
     save_spatial_plan(block_root / "spatial_mvs_report.json", report)
     tracker.set("patch_match", "completed", message="空间分块PatchMatch完成", details=report)
@@ -2399,6 +2575,14 @@ def run_colmap_ba_mvs(
         sparse_warnings.append(
             "照片仍分成多个互不连接的组；缺少共同可见区域时无法可靠自动合并"
         )
+    excluded_mvs_references = list(
+        mvs_selection.get("excluded_reference_images", [])
+    )
+    if excluded_mvs_references:
+        sparse_warnings.append(
+            f"{len(excluded_mvs_references)}张照片已有相机位姿但没有稀疏点；"
+            "已自动保留为辅助照片，不生成独立深度图"
+        )
     if float(sparse_quality["registration_ratio"]) < 0.8:
         sparse_warnings.append(
             f"仅注册 {sparse_quality['registered_images']}/{len(expected_names)} 张照片；"
@@ -2515,11 +2699,27 @@ def run_colmap_ba_mvs(
                 tracker=dense_stages,
             )
 
+        def spatial_mvs_valid() -> bool:
+            if _ply_vertex_count(fused) <= 0 or not spatial_report_path.is_file():
+                return False
+            try:
+                payload = json.loads(
+                    spatial_report_path.read_text(encoding="utf-8")
+                )
+                return (
+                    int(payload.get("version", 0))
+                    >= SPATIAL_BLOCK_PLAN_VERSION
+                    and int(payload.get("source_map_policy_version", 0))
+                    >= _SPATIAL_SOURCE_MAP_POLICY_VERSION
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+
         run_stage(
             "spatial_block_mvs",
             0.64,
             "按空三共视关系执行Core/Halo空间分块MVS",
-            lambda: _ply_vertex_count(fused) > 0 and spatial_report_path.is_file(),
+            spatial_mvs_valid,
             run_spatial_mvs,
         )
         if not spatial_report:
@@ -2529,6 +2729,16 @@ def run_colmap_ba_mvs(
 
         final_ply = dense / "pointcloud_ai_photogrammetry.ply"
         output_metadata_path = dense / "pointcloud_output.json"
+
+        def spatial_pointcloud_output_valid() -> bool:
+            if not fused.is_file() or not output_metadata_path.is_file():
+                return False
+            if not final_ply.is_file():
+                return _ply_vertex_count(fused) > 0
+            try:
+                return os.path.samefile(fused, final_ply)
+            except OSError:
+                return False
 
         def write_spatial_pointcloud_output() -> None:
             point_count = _ply_vertex_count(fused)
@@ -2565,8 +2775,7 @@ def run_colmap_ba_mvs(
             "pointcloud_output",
             0.95,
             "写出空间分块合并点云",
-            lambda: (final_ply.is_file() or fused.is_file())
-            and output_metadata_path.is_file(),
+            spatial_pointcloud_output_valid,
             write_spatial_pointcloud_output,
         )
         mapping_payload = json.loads(mapping_path.read_text(encoding="utf-8"))
@@ -2608,8 +2817,15 @@ def run_colmap_ba_mvs(
                 "fusion_cache_size_gb": int(fusion_cache_size_gb),
                 "fusion_num_threads": int(fusion_num_threads),
                 "fusion_strategy": "core_halo_spatial_blocks",
-                "configured_reference_images": registered_images,
-                "reference_strategy": "all_registered_spatially_assigned",
+                "configured_reference_images": int(
+                    spatial_report.get(
+                        "configured_reference_image_count", registered_images
+                    )
+                ),
+                "excluded_reference_images": list(
+                    spatial_report.get("excluded_reference_images", [])
+                ),
+                "reference_strategy": "all_depth_supported_spatially_assigned",
                 "requested_reference_ratio": 1.0,
                 "sparse_point_coverage_ratio": float(
                     mvs_selection["sparse_point_coverage_ratio"]

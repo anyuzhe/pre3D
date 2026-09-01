@@ -2,10 +2,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ai_photogrammetry.engineering.mvs_selection import read_sparse_views
+from ai_photogrammetry.engineering.mvs_selection import SparseView, read_sparse_views
 from ai_photogrammetry.engineering.spatial_blocks import (
+    _augment_reference_coverage,
     crop_fused_ply_to_core,
     plan_spatial_blocks,
+    read_sparse_points,
     write_block_patch_match_config,
 )
 
@@ -70,8 +72,51 @@ def test_corridor_plan_uses_core_halo_and_visibility(tmp_path: Path):
         for block in plan["blocks"]
         for name in block["reference_images"]
     ]
-    assert plan["total_reference_image_assignments"] == 16
-    assert len(references) == len(set(references)) == 16
+    assert plan["version"] == 3
+    assert plan["total_reference_image_assignments"] >= 16
+    assert len(set(references)) == plan["unique_reference_image_count"] == 16
+    assert all(
+        block["core_reference_coverage_ratio"] >= 0.95
+        for block in plan["blocks"]
+    )
+    # Corridor blocks only partition PCA axis 0. The other Core dimensions
+    # must extend beyond sparse bounds so dense rock thickness is not clipped.
+    _, xyz = read_sparse_points(points)
+    frame = plan["coordinate_frame"]
+    local = (
+        xyz - np.asarray(frame["center"], dtype=np.float64)
+    ) @ np.asarray(frame["basis"], dtype=np.float64)
+    assert all(
+        all(
+            block["core_lower"][axis] < float(np.min(local[:, axis]))
+            and block["core_upper"][axis] > float(np.max(local[:, axis]))
+            for axis in (1, 2)
+        )
+        for block in plan["blocks"]
+    )
+
+
+def test_reference_coverage_promotes_halo_views_for_two_view_support():
+    views = [
+        SparseView(1, "owner.jpg", frozenset({1, 2})),
+        SparseView(2, "halo_a.jpg", frozenset({1, 2, 3})),
+        SparseView(3, "halo_b.jpg", frozenset({3, 4})),
+        SparseView(4, "halo_c.jpg", frozenset({4})),
+    ]
+
+    selected, coverage, zero_ratio, added = _augment_reference_coverage(
+        ["owner.jpg"],
+        [view.name for view in views],
+        {1, 2, 3, 4},
+        {view.name.casefold(): view for view in views},
+        minimum_observations=2,
+        target_coverage=1.0,
+    )
+
+    assert selected == ["owner.jpg", "halo_a.jpg", "halo_b.jpg", "halo_c.jpg"]
+    assert coverage == 1.0
+    assert zero_ratio == 0.0
+    assert added == 3
 
 
 def test_block_patch_match_config_never_uses_remote_auto_sources(tmp_path: Path):
@@ -111,6 +156,8 @@ def test_halo_sources_are_not_promoted_to_reference_views(tmp_path: Path):
         views,
         source_count=6,
         source_image_names=source_pool,
+        stable_source_image_names=references,
+        minimum_stable_sources=3,
     )
 
     lines = config.read_text(encoding="utf-8").splitlines()
@@ -121,6 +168,67 @@ def test_halo_sources_are_not_promoted_to_reference_views(tmp_path: Path):
         for row in lines[1::2]
         for source in row.split(",")
     )
+    reference_set = set(references)
+    for reference, row in zip(lines[::2], lines[1::2]):
+        stable_sources = {
+            source.strip() for source in row.split(",")
+        } & (reference_set - {reference})
+        assert len(stable_sources) >= 3
+
+
+def test_patch_match_prefers_a_full_set_of_available_dense_map_sources(
+    tmp_path: Path,
+):
+    views = [
+        SparseView(1, "reference.jpg", frozenset({1, 2, 3, 4})),
+        SparseView(2, "stable_1.jpg", frozenset({1, 2})),
+        SparseView(3, "stable_2.jpg", frozenset({1, 3})),
+        SparseView(4, "stable_3.jpg", frozenset({1, 4})),
+        SparseView(5, "stable_4.jpg", frozenset({2, 3})),
+        SparseView(6, "missing_map.jpg", frozenset({1, 2, 3, 4})),
+    ]
+    config = tmp_path / "patch-match.cfg"
+    stable = [view.name for view in views[1:5]]
+
+    write_block_patch_match_config(
+        config,
+        ["reference.jpg"],
+        views,
+        source_count=4,
+        source_image_names=[view.name for view in views],
+        stable_source_image_names=["reference.jpg", *stable],
+        minimum_stable_sources=3,
+    )
+
+    sources = {
+        value.strip()
+        for value in config.read_text(encoding="utf-8").splitlines()[1].split(",")
+    }
+    assert sources == set(stable)
+    assert "missing_map.jpg" not in sources
+
+
+def test_patch_match_config_skips_reference_without_sparse_depth_support(
+    tmp_path: Path,
+):
+    images, _ = _write_corridor_model(tmp_path)
+    with images.open("a", encoding="utf-8") as stream:
+        stream.write("17 1 0 0 0 17 0 0 1 pose_only.jpg\n")
+        stream.write("10.0 20.0 -1 30.0 40.0 -1\n")
+    views = read_sparse_views(images)
+    references = [view.name for view in views]
+    config = tmp_path / "patch-match.cfg"
+
+    count = write_block_patch_match_config(
+        config,
+        references,
+        views,
+        source_count=4,
+    )
+
+    lines = config.read_text(encoding="utf-8").splitlines()
+    assert count == 16
+    assert "pose_only.jpg" not in lines[::2]
 
 
 def test_binary_fused_cloud_is_stream_cropped_to_core(tmp_path: Path):

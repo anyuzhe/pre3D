@@ -109,14 +109,29 @@ def select_mvs_references(
         raise ValueError("MVS参考帧策略必须是 covisibility 或 all")
     if not 0.1 <= reference_ratio <= 1.0:
         raise ValueError("MVS参考帧比例必须在 0.1～1.0 之间")
-    views = read_sparse_views(images_txt)
+    registered_views = read_sparse_views(images_txt)
+    registered_count = len(registered_views)
+    if registered_count < 3:
+        raise RuntimeError("注册照片少于3张，无法选择MVS参考帧")
+    # COLMAP derives an automatic depth interval for every PatchMatch
+    # reference from the sparse 3D points observed by that image.  A mapper
+    # can still return a valid pose for an image whose observations are all
+    # untriangulated (POINT3D_ID == -1).  Such an image is useful project
+    # metadata and may remain in the source pool, but asking PatchMatch to
+    # create its depth map makes the native process fail after the other
+    # views have finished.  Only views with sparse depth support may own a
+    # reference depth map.
+    views = [view for view in registered_views if view.point_ids]
+    excluded_views = [view for view in registered_views if not view.point_ids]
     count = len(views)
     if count < 3:
-        raise RuntimeError("注册照片少于3张，无法选择MVS参考帧")
+        raise RuntimeError(
+            "具备稀疏点深度约束的注册照片少于3张，无法执行MVS"
+        )
     target = (
         count
         if strategy == "all"
-        else min(count, max(3, math.ceil(count * reference_ratio)))
+        else min(count, max(3, math.ceil(registered_count * reference_ratio)))
     )
     all_points = set().union(*(view.point_ids for view in views))
     if target == count:
@@ -193,11 +208,15 @@ def select_mvs_references(
     selected_names = [view.name for view in selected_views]
     return {
         "strategy": strategy,
-        "registered_image_count": count,
+        "registered_image_count": registered_count,
+        "depth_supported_image_count": count,
         "reference_image_count": len(selected_names),
-        "helper_source_image_count": count - len(selected_names),
+        "helper_source_image_count": registered_count - len(selected_names),
+        "excluded_reference_image_count": len(excluded_views),
+        "excluded_reference_images": [view.name for view in excluded_views],
         "requested_reference_ratio": float(reference_ratio),
-        "actual_reference_ratio": len(selected_names) / count,
+        "actual_reference_ratio": len(selected_names) / registered_count,
+        "eligible_reference_ratio": len(selected_names) / count,
         "sparse_point_count": len(all_points),
         "covered_sparse_point_count": len(covered_points),
         "sparse_point_coverage_ratio": (
